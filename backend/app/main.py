@@ -1,96 +1,231 @@
-from fastapi import FastAPI, HTTPException
+"""
+PAI Intelligence Engine - Main FastAPI Application
+
+This module defines the FastAPI application and API endpoints for the
+Personal AI Filter (PAI) system, which provides:
+- Text vectorization using Gemini embeddings
+- Context storage and retrieval via Pinecone
+- AI-powered insights with RAG (Retrieval Augmented Generation)
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from app.services.gemini_service import get_text_embedding, get_gemini_response
-from app.services.pinecone_service import upsert_context, search_similar_context
-from app.core.config import settings
 
-app = FastAPI(title="PAI Intelligence Engine", version="0.1.0")
+from app.core.config import Settings, get_settings, settings
+from app.core.exceptions import PAIException, pai_exception_handler, validation_exception_handler
+from app.core.logging import get_logger, setup_logging
+from app.middleware.rate_limiter import rate_limiter
+from app.models.requests import SearchInput, TextInput
+from app.models.responses import (
+    ContextResponse,
+    HealthResponse,
+    InsightResponse,
+    MatchResult,
+    SearchResponse,
+    VectorizeResponse,
+)
+from app.services.gemini_service import get_gemini_response, get_text_embedding
+from app.services.pinecone_service import search_similar_context, upsert_context
 
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan manager for startup/shutdown events."""
+    # Startup
+    setup_logging(settings.LOG_LEVEL)
+    logger.info("PAI Intelligence Engine starting up...")
+    logger.info(f"Environment: {settings.APP_ENV}")
+    yield
+    # Shutdown
+    logger.info("PAI Intelligence Engine shutting down...")
+
+
+app = FastAPI(
+    title="PAI Intelligence Engine",
+    description="Personal AI Filter - Context-aware AI assistant with memory",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+# Register exception handlers
+app.add_exception_handler(PAIException, pai_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class TextInput(BaseModel):
-    text: str
 
-@app.get("/")
-def read_root():
-    return {
-        "status": "online",
-        "service": "PAI Intelligence Engine",
-        "config": {
-            "gemini_configured": bool(settings.GOOGLE_API_KEY),
-            "pinecone_configured": bool(settings.PINECONE_API_KEY)
-        }
-    }
-
-@app.post("/api/v1/vectorize")
-async def vectorize_text(input_data: TextInput):
-    vector = await get_text_embedding(input_data.text)
-    if not vector:
-        raise HTTPException(status_code=500, detail="Failed to generate embedding")
-    return {
-        "original_text": input_data.text,
-        "vector_dimension": len(vector),
-        "vector_preview": vector[:5]
-    }
-
-@app.post("/api/v1/context")
-async def store_context(input_data: TextInput):
+@app.get("/", response_model=HealthResponse, tags=["Health"])
+def read_root(config: Settings = Depends(get_settings)) -> HealthResponse:
     """
-    고민을 벡터화하여 기억장치(Pinecone)에 저장합니다.
+    Health check endpoint.
+
+    Returns the service status and configuration state.
+    """
+    return HealthResponse(
+        status="online",
+        service="PAI Intelligence Engine",
+        config={
+            "gemini_configured": bool(config.GOOGLE_API_KEY),
+            "pinecone_configured": bool(config.PINECONE_API_KEY),
+        },
+    )
+
+
+@app.post(
+    "/api/v1/vectorize",
+    response_model=VectorizeResponse,
+    tags=["Embedding"],
+    dependencies=[Depends(rate_limiter)],
+)
+async def vectorize_text(input_data: TextInput) -> VectorizeResponse:
+    """
+    Convert text to a vector embedding.
+
+    Uses Gemini text-embedding-004 model to generate a 768-dimensional
+    vector representation of the input text.
+    """
+    vector = await get_text_embedding(input_data.text)
+
+    if not vector:
+        logger.error(f"Failed to generate embedding for text: {input_data.text[:50]}...")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "embedding_failed",
+                "message": "Failed to generate embedding. Please try again.",
+            },
+        )
+
+    return VectorizeResponse(
+        original_text=input_data.text,
+        vector_dimension=len(vector),
+        vector_preview=vector[:5],
+    )
+
+
+@app.post(
+    "/api/v1/context",
+    response_model=ContextResponse,
+    tags=["Memory"],
+    dependencies=[Depends(rate_limiter)],
+)
+async def store_context(input_data: TextInput) -> ContextResponse:
+    """
+    Store context in the vector database (Pinecone).
+
+    Vectorizes the input text and stores it for future retrieval
+    during RAG-enhanced insight generation.
     """
     vector_id = await upsert_context(input_data.text)
+
     if not vector_id:
-        raise HTTPException(status_code=500, detail="Failed to store context in Vector DB")
-    return {"status": "success", "id": vector_id, "message": "Context remembered."}
+        logger.error(f"Failed to store context: {input_data.text[:50]}...")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "vector_db_error",
+                "message": "Failed to store context in Vector DB",
+            },
+        )
 
-@app.post("/api/v1/search")
-async def search_context(input_data: TextInput):
-    """
-    유사한 과거 고민을 검색합니다.
-    """
-    matches = await search_similar_context(input_data.text)
-    return {"matches": matches}
+    logger.info(f"Context stored with ID: {vector_id}")
+    return ContextResponse(id=vector_id, message="Context remembered.")
 
-@app.post("/api/v1/insight")
-async def generate_insight(input_data: TextInput):
+
+@app.post(
+    "/api/v1/search",
+    response_model=SearchResponse,
+    tags=["Memory"],
+    dependencies=[Depends(rate_limiter)],
+)
+async def search_context(input_data: SearchInput) -> SearchResponse:
     """
-    RAG 적용: 과거 기억(Pinecone)을 검색하여 Gemini에게 맥락을 제공합니다.
+    Search for similar past contexts.
+
+    Queries Pinecone for vectors similar to the input text.
     """
-    # 1. 관련 기억 검색 (유사도 0.7 이상만)
+    matches = await search_similar_context(input_data.text, top_k=input_data.top_k)
+
+    return SearchResponse(
+        matches=[
+            MatchResult(
+                id=m.get("id", ""),
+                score=m.get("score", 0.0),
+                text=m.get("metadata", {}).get("text", ""),
+                metadata=m.get("metadata", {}),
+            )
+            for m in matches
+        ],
+        query=input_data.text,
+        total_results=len(matches),
+    )
+
+
+@app.post(
+    "/api/v1/insight",
+    response_model=InsightResponse,
+    tags=["AI"],
+    dependencies=[Depends(rate_limiter)],
+)
+async def generate_insight(input_data: TextInput) -> InsightResponse:
+    """
+    Generate AI insight using RAG (Retrieval Augmented Generation).
+
+    Searches for relevant past contexts and uses them to enhance
+    the AI's response with personalized, contextual information.
+    """
+    # 1. Search for relevant memories (similarity > 0.7)
     matches = await search_similar_context(input_data.text, top_k=3)
-    
-    relevant_contexts = []
-    for m in matches:
-        if m['score'] > 0.7:  # 유사도가 높은 기억만 참조
-            relevant_contexts.append(f"- {m['metadata']['text']} (유사도: {m['score']:.2f})")
-    
-    memory_text = "\n".join(relevant_contexts) if relevant_contexts else "관련된 과거 기억이 없습니다."
 
-    # 2. 프롬프트 구성
+    relevant_contexts: list[str] = []
+    for m in matches:
+        score = m.get("score", 0.0)
+        if score > 0.7:
+            text = m.get("metadata", {}).get("text", "")
+            relevant_contexts.append(f"- {text} (similarity: {score:.2f})")
+
+    memory_text = (
+        "\n".join(relevant_contexts)
+        if relevant_contexts
+        else "No relevant past memories found."
+    )
+
+    # 2. Construct RAG prompt
     prompt = f"""
-    당신은 사용자의 맥락을 깊이 이해하는 AI 파트너 'PAI'입니다.
-    
-    [사용자의 과거 고민/관심사 (Memory)]
+    You are PAI, an AI partner who deeply understands the user's context.
+
+    [User's Past Concerns/Interests (Memory)]
     {memory_text}
 
-    [현재 입력]
+    [Current Input]
     {input_data.text}
 
-    [지시사항]
-    위의 '과거 기억'을 참고하여 현재 입력에 대한 통찰력 있는 피드백을 주세요. 
-    과거에 했던 고민과 연결된다면 그 연관성을 언급해 주세요.
+    [Instructions]
+    Please provide insightful feedback on the current input, referencing the 'past memories' above.
+    If there are connections to previous concerns, mention those relationships.
     """
 
-    # 3. 답변 생성
+    # 3. Generate response
     response = get_gemini_response(prompt)
-    return {
-        "insight": response,
-        "context_used": relevant_contexts  # 디버깅용: 어떤 기억을 참고했는지 반환
-    }
+
+    logger.info(f"Generated insight with {len(relevant_contexts)} context references")
+
+    return InsightResponse(
+        insight=response,
+        context_used=relevant_contexts,
+        model_used="gemini-3-flash-preview",
+    )

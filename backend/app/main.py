@@ -29,8 +29,11 @@ from app.models.responses import (
     SearchResponse,
     VectorizeResponse,
 )
+from app.models.news import FeedSource, Signal, SignalResponse
+from app.services.crawler_service import fetch_all_feeds, get_available_feeds
 from app.services.gemini_service import get_gemini_response, get_text_embedding
 from app.services.pinecone_service import search_similar_context, upsert_context
+from app.services.signal_service import generate_signals, get_news_count, process_articles
 
 logger = get_logger(__name__)
 
@@ -229,3 +232,107 @@ async def generate_insight(input_data: TextInput) -> InsightResponse:
         context_used=relevant_contexts,
         model_used="gemini-3-flash-preview",
     )
+
+
+# =============================================================================
+# Sprint 2: Signal System Endpoints
+# =============================================================================
+
+
+@app.get("/api/v1/feeds", tags=["Signals"])
+async def list_feeds() -> list[FeedSource]:
+    """
+    Get list of available RSS feed sources.
+
+    Returns configured feed sources that can be used for news collection.
+    """
+    return get_available_feeds()
+
+
+@app.post("/api/v1/feeds/fetch", tags=["Signals"], dependencies=[Depends(rate_limiter)])
+async def fetch_news(limit_per_feed: int = 10):
+    """
+    Fetch and process news articles from all RSS feeds.
+
+    This endpoint:
+    1. Fetches articles from all configured RSS feeds
+    2. Generates embeddings for each article
+    3. Stores embeddings in Pinecone for similarity search
+
+    Args:
+        limit_per_feed: Maximum articles to fetch per feed (default: 10)
+
+    Returns:
+        Summary of fetched and processed articles.
+    """
+    # Fetch articles from RSS feeds
+    articles = await fetch_all_feeds(limit_per_feed=limit_per_feed)
+
+    if not articles:
+        return {
+            "status": "warning",
+            "message": "No articles fetched from feeds",
+            "fetched": 0,
+            "processed": 0,
+        }
+
+    # Process articles (embed and store)
+    processed_count = await process_articles(articles)
+
+    return {
+        "status": "success",
+        "message": f"Fetched {len(articles)} articles, processed {processed_count}",
+        "fetched": len(articles),
+        "processed": processed_count,
+        "sources": list(set(a.source for a in articles)),
+    }
+
+
+@app.post(
+    "/api/v1/signals",
+    response_model=SignalResponse,
+    tags=["Signals"],
+    dependencies=[Depends(rate_limiter)],
+)
+async def get_signals(input_data: TextInput, top_k: int = 10, min_score: float = 3.0):
+    """
+    Generate personalized signals based on user context.
+
+    Searches for news articles that match the user's context/interests
+    and returns them ranked by relevance score (0-10).
+
+    Args:
+        input_data: User's current context or interests.
+        top_k: Maximum number of signals to return (default: 10).
+        min_score: Minimum relevance score threshold (default: 3.0).
+
+    Returns:
+        SignalResponse with ranked signals.
+    """
+    signals = await generate_signals(
+        user_context=input_data.text,
+        top_k=top_k,
+        min_score=min_score,
+    )
+
+    return SignalResponse(
+        signals=signals,
+        total=len(signals),
+        user_context=input_data.text[:100] + "..." if len(input_data.text) > 100 else input_data.text,
+    )
+
+
+@app.get("/api/v1/signals/stats", tags=["Signals"])
+async def get_signal_stats():
+    """
+    Get statistics about the signal system.
+
+    Returns information about stored news articles and system status.
+    """
+    news_count = await get_news_count()
+
+    return {
+        "news_articles_count": news_count,
+        "feeds_configured": len(get_available_feeds()),
+        "status": "ready" if news_count > 0 else "empty",
+    }

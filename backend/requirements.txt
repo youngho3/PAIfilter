@@ -10,5 +10,9 @@ pydantic-settings>=2.0.0
 google-generativeai>=0.8.0
 pinecone>=8.0.0
 
+# HTTP Client & RSS
+httpx>=0.26.0
+feedparser>=6.0.0
+
 # Utilities
 python-dotenv>=1.0.0
